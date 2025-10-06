@@ -1,9 +1,10 @@
 
-# streamlit_app.py — Paste Analyzer with robust PRE-GAME logic for your entry
+# streamlit_app.py — Paste Analyzer with robust PRE-GAME logic + manual override
 # Everyone: Missing Numbers method
-# Your entry: PRE-GAME (derived from scoreboard area: time headers, matchup codes like "KC-JAX", or "TIE" blocks)
+# Your entry: PRE-GAME (from scoreboard headers/codes) OR manual override of remaining teams
 # Treats "- (N)" as used
 # Requires: streamlit, pandas
+# Version: v1.1.1
 
 import re
 from dataclasses import dataclass
@@ -101,7 +102,7 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[str]]:
     while i < n and not RANK_RE.match(lines[i]):
         line = lines[i]
 
-        # FINAL or LIVE -> skip the typical block if teams present, else step
+        # FINAL or LIVE -> skip if teams present, else step
         if IS_FINAL.search(line) or IS_LIVE.search(line):
             if i + 2 < n and TEAM_RE.match(lines[i+1]) and TEAM_RE.match(lines[i+2]):
                 i += 5 if i + 4 < n else 3  # status + team + team (+scores)
@@ -194,14 +195,15 @@ def pts_remaining_missing_numbers(p: Participant, max_conf: int) -> int:
     used = {c for _, c in p.picks}  # '-' counts as used
     return sum(c for c in range(1, max_conf + 1) if c not in used)
 
-def pts_remaining_pregame_only(p: Participant, pregame_teams: Set[str]) -> int:
-    return sum(conf for (team, conf) in p.picks if team != "-" and norm_team(team) in pregame_teams)
+def pts_remaining_for_entry(p: Participant, remaining_teams: Set[str]) -> int:
+    # Only sum confidences where the TEAM is in remaining_teams; ignore '-' picks
+    return sum(conf for (team, conf) in p.picks if team != "-" and norm_team(team) in remaining_teams)
 
 # --------------- UI ---------------
 st.set_page_config(page_title="CBS Pick 'Em — Paste Analyzer", layout="wide")
-st.title("🏈 CBS Pick 'Em — Paste Analyzer (Robust PRE-GAME)")
-st.caption("Everyone uses **Missing Numbers**. Your selected entry uses **PRE-GAME** from scoreboard headers/codes. "
-           "We scan ahead after time headers, accept codes like **KC-JAX**, and normalize team aliases (JAC↔JAX, WSH↔WAS, SD→LAC, STL→LAR, OAK→LV, etc.).")
+st.title("🏈 CBS Pick 'Em — Paste Analyzer (PRE-GAME + manual override)")
+st.caption("Everyone uses **Missing Numbers**. Your selected entry uses **PRE-GAME** from headers/codes "
+           "or a **manual remaining teams** override. Live/Final games do not count as remaining.")
 
 raw = st.text_area("Paste the visible text from your Weekly Standings page:", height=380)
 override_max = st.number_input("Optional: Override Max Confidence (leave 0 to auto)", 0, 30, 0, 1)
@@ -217,7 +219,7 @@ if st.button("Analyze", type="primary"):
             if not parts:
                 st.warning("No participants parsed. Double-check your paste.")
             else:
-                # Choose your entry (used for PRE-GAME method)
+                # Choose your entry
                 names = [p.name for p in parts]
                 your_name = st.selectbox("Your entry (optional):", ["(none)"] + names, index=0)
 
@@ -226,12 +228,24 @@ if st.button("Analyze", type="primary"):
                 auto_max = max(all_confs) if all_confs else 0
                 max_conf = override_max if override_max > 0 else auto_max
 
+                # Manual override for remaining teams (pre-populated with detected PRE-GAME teams)
+                all_team_tokens = sorted({norm_team(t) for p in parts for (t, _) in p.picks if t != "-"})
+                manual_teams = st.multiselect(
+                    "Manual override — Remaining matchup teams (optional)",
+                    options=all_team_tokens,
+                    default=sorted(pregame_teams),
+                    help="If the header detection missed your last game, pick the two teams here. "
+                         "Used only for YOUR entry."
+                )
+                manual_set = set(manual_teams)
+
                 # Build table
                 rows = []
                 for p in parts:
                     pts_rem = pts_remaining_missing_numbers(p, max_conf)
                     if your_name != "(none)" and p.name == your_name:
-                        pts_rem = pts_remaining_pregame_only(p, pregame_teams)
+                        remaining = manual_set if manual_set else pregame_teams
+                        pts_rem = pts_remaining_for_entry(p, remaining)
                     rows.append({
                         "Name": p.name,
                         "Current Standing": p.rank,
@@ -247,17 +261,20 @@ if st.button("Analyze", type="primary"):
                 ).reset_index(drop=True)
 
                 # Header
-                left, right = st.columns([1, 2])
+                left, mid, right = st.columns([1, 2, 2])
                 with left: st.metric("Week Size (Max Confidence)", max_conf)
+                with mid:
+                    st.caption("Detected PRE-GAME teams (normalized): " + (", ".join(sorted(pregame_teams)) if pregame_teams else "none"))
                 with right:
-                    st.caption("PRE-GAME teams (normalized): " + (", ".join(sorted(pregame_teams)) if pregame_teams else "none"))
+                    if your_name != "(none)":
+                        st.caption(f"Remaining teams used for **{your_name}**: " + (", ".join(sorted(manual_set if manual_set else pregame_teams)) or "none"))
 
                 st.divider()
                 st.subheader("Standings with Remaining Ceiling")
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
                 # Debug expander
-                with st.expander("Debug — PRE-GAME detection & your picks"):
+                with st.expander("Debug — headers/codes & your picks"):
                     st.write("**PRE-GAME header/code lines detected:**")
                     if pregame_headers:
                         for h in pregame_headers:
@@ -269,10 +286,13 @@ if st.button("Analyze", type="primary"):
                         you = next((p for p in parts if p.name == your_name), None)
                         if you:
                             st.write(f"**Your picks (normalized):** {[(t, c) for (t, c) in you.picks]}")
-                            st.write(f"**PRE-GAME teams (normalized):** {sorted(pregame_teams)}")
-                            pre_pts = pts_remaining_pregame_only(you, pregame_teams)
-                            st.write(f"**PRE-GAME points sum for {your_name}: {pre_pts}**")
+                            st.write(f"**Remaining teams applied:** {sorted(manual_set if manual_set else pregame_teams)}")
+                            pre_pts = pts_remaining_for_entry(you, manual_set if manual_set else pregame_teams)
+                            st.write(f"**Points Remaining for {your_name}: {pre_pts}")
 
         except Exception as e:
             st.error(f"Parsing failed: {e}")
             st.info("Make sure the scoreboard header section is included (time lines, matchup codes, or TIE).")
+
+st.divider()
+st.caption("Version: v1.1.1")
