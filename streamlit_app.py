@@ -1,6 +1,6 @@
 
-# streamlit_app.py — Paste Analyzer with stronger header scan + redundancy + check-figures
-# Version: v1.4.2
+# streamlit_app.py — Robust header scan + safe multiselect defaults + check-figures
+# Version: v1.4.3
 
 import re
 from dataclasses import dataclass
@@ -97,10 +97,12 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
             continue
 
         if IS_TIME.search(line):
-            # Look ahead up to 5 lines for TEAM/TEAM
+            # Look ahead up to 6 lines for TEAM/TEAM (handle an intervening 'TIE' or dash)
             found = []
-            for j in range(i+1, min(i+6, n)):
+            for j in range(i+1, min(i+7, n)):
                 tok = lines[j]
+                if NOISE_RE.match(tok):
+                    continue
                 if TEAM_RE.match(tok) and tok != "-":
                     found.append(norm_team(tok))
                     if len(found) == 2:
@@ -136,11 +138,20 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
     if start_idx > 0 and not pregame_pairs:
         for k in range(0, start_idx):
             if IS_TIME.search(lines[k]) and k + 2 < start_idx:
-                if TEAM_RE.match(lines[k+1]) and TEAM_RE.match(lines[k+2]):
-                    a = norm_team(lines[k+1]); b = norm_team(lines[k+2])
-                    pregame_pairs.append((a,b))
-                    pregame_teams.update([a,b])
-                    pregame_headers.append(lines[k])
+                # seek two team codes within next 6 lines
+                found = []
+                for j in range(k+1, min(k+7, start_idx)):
+                    tok = lines[j]
+                    if NOISE_RE.match(tok):
+                        continue
+                    if TEAM_RE.match(tok) and tok != "-":
+                        found.append(norm_team(tok))
+                        if len(found) == 2:
+                            a,b = found[0], found[1]
+                            pregame_pairs.append((a,b))
+                            pregame_teams.update([a,b])
+                            pregame_headers.append(lines[k])
+                            break
 
     # Deduplicate pairs
     if pregame_pairs:
@@ -226,7 +237,7 @@ def pts_remaining_by_count_diff(your: Participant, others: List[Participant]) ->
 # ---------------- UI ----------------
 st.set_page_config(page_title="CBS Pick 'Em — Analyzer", layout="wide")
 st.title("🏈 CBS Pick 'Em — Analyzer")
-st.caption("Header detection + manual override + fallback. Now with check-figures and redundant time scanner.")
+st.caption("Header detection + manual override + fallback. Now with check-figures and safe defaults.")
 
 raw = st.text_area("Paste the visible text from your Weekly Standings page (include the scoreboard at the top):", height=420)
 override_max = st.number_input("Optional: Override Max Confidence (leave 0 to auto)", 0, 30, 0, 1)
@@ -249,12 +260,15 @@ if st.button("Analyze", type="primary"):
                 auto_max = max(all_confs) if all_confs else 0
                 max_conf = override_max if override_max > 0 else auto_max
 
-                # Manual override for remaining teams
-                all_team_tokens = sorted({norm_team(t) for p in parts for (t, _) in p.picks if t != "-"})
+                # Manual override for remaining teams — ensure options include pregame teams too
+                pick_tokens = {norm_team(t) for p in parts for (t, _) in p.picks if t != "-"}
+                options_all = sorted(pick_tokens.union(pregame_teams))
+                defaults = sorted(pregame_teams.intersection(pick_tokens)) if pick_tokens else sorted(pregame_teams)
+                # If defaults would be empty but we still have pregame teams not in picks, allow empty default (user can select)
                 manual_teams = st.multiselect(
                     "Manual override — Remaining matchup teams (optional)",
-                    options=all_team_tokens,
-                    default=sorted(pregame_teams),
+                    options=options_all,
+                    default=defaults,
                     help="If header detection missed your last game, pick the two teams here. Used only for YOUR entry."
                 )
                 manual_set = set(manual_teams)
@@ -315,4 +329,4 @@ if st.button("Analyze", type="primary"):
             st.error(f"Parsing failed: {e}")
 
 st.divider()
-st.caption("Version: v1.4.2")
+st.caption("Version: v1.4.3")
