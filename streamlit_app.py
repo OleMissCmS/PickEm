@@ -1,6 +1,6 @@
 
-# streamlit_app.py — Paste Analyzer with stronger header scan + check-figures
-# Version: v1.4.1
+# streamlit_app.py — Paste Analyzer with stronger header scan + redundancy + check-figures
+# Version: v1.4.2
 
 import re
 from dataclasses import dataclass
@@ -53,32 +53,16 @@ CONF_ONLY_RE = re.compile(r"^\s*\(\s*(\d{1,2})\s*\)\s*$")
 
 IS_FINAL = re.compile(r"\bfinal\b", re.I)
 IS_LIVE  = re.compile(r"\b(q[1-4]|1st|2nd|3rd|4th|ot)\b|\b\d{1,2}:\d{2}\b", re.I)
-# Expanded time regex to allow "pm", "p.m.", and optional tz token like CT/ET
 IS_TIME  = re.compile(r"(?:(Mon|Tue|Tues|Wed|Thu|Thur|Fri|Sat|Sun)|Today|Tonight)\s+\d{1,2}:\d{2}\s*[AaPp]\.?\s*[Mm]\.?(?:\s*(ET|CT|MT|PT))?\b", re.I)
 IS_CODE  = re.compile(r"^[A-Za-z]{2,4}\s*-\s*[A-Za-z]{2,4}$")
 NOISE_RE = re.compile(r"^(TIE|[–—-])$", re.I)
 
 def _clean_lines(raw: str) -> List[str]:
-    # Normalize non-breaking spaces
     raw = raw.replace("\xa0", " ")
     lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
     return [ln for ln in lines if ln]
 
-def _look_ahead_two_teams(lines: List[str], start: int, window: int = 8) -> Optional[Tuple[str, str]]:
-    found = []
-    n = len(lines)
-    for j in range(start + 1, min(start + 1 + window, n)):
-        tok = lines[j].strip()
-        if NOISE_RE.match(tok):
-            continue
-        if TEAM_RE.match(tok) and tok != "-":
-            found.append(norm_team(tok))
-            if len(found) == 2:
-                return found[0], found[1]
-    return None
-
 def _looks_like_participant_block(lines: List[str], i: int) -> bool:
-    """Return True if lines[i] is the start of a participant block: rank, name, points line."""
     n = len(lines)
     if i >= n or not RANK_RE.match(lines[i]):
         return False
@@ -86,10 +70,8 @@ def _looks_like_participant_block(lines: List[str], i: int) -> bool:
         return False
     name_line = lines[i+1]
     points_line = lines[i+2]
-    # Name: letters/spaces and not obviously a team code or time header
     if TEAM_RE.match(name_line) or IS_TIME.search(name_line) or IS_CODE.match(name_line):
         return False
-    # Points line should have at least a number
     if not (NUMS_LINE_2INTS_RE.match(points_line) or re.search(r"\d", points_line)):
         return False
     return True
@@ -100,16 +82,14 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
     pregame_headers: List[str] = []
     i, n = 0, len(lines)
 
+    # Primary scan
     while i < n:
-        # Only break when we are sure we've hit the participant table
         if _looks_like_participant_block(lines, i):
             break
 
         line = lines[i]
 
-        # Skip finished/live blocks
         if IS_FINAL.search(line) or IS_LIVE.search(line):
-            # Try to leap over a scoreboard cluster if present
             if i + 2 < n and TEAM_RE.match(lines[i+1]) and TEAM_RE.match(lines[i+2]):
                 i += 5 if i + 4 < n else 3
             else:
@@ -117,12 +97,18 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
             continue
 
         if IS_TIME.search(line):
-            pair = _look_ahead_two_teams(lines, i, window=8)
-            if pair:
-                a, b = pair
-                pregame_pairs.append((a,b))
-                pregame_teams.update([a, b])
-                pregame_headers.append(line)
+            # Look ahead up to 5 lines for TEAM/TEAM
+            found = []
+            for j in range(i+1, min(i+6, n)):
+                tok = lines[j]
+                if TEAM_RE.match(tok) and tok != "-":
+                    found.append(norm_team(tok))
+                    if len(found) == 2:
+                        a,b = found[0], found[1]
+                        pregame_pairs.append((a,b))
+                        pregame_teams.update([a,b])
+                        pregame_headers.append(line)
+                        break
             i += 1
             continue
 
@@ -144,9 +130,19 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
 
         i += 1
 
-    # Ensure we start participants exactly at the first block
     start_idx = i
-    # Deduplicate pairs (KC-JAX and code line both present)
+
+    # Redundant mini-scan in the header region (0..start_idx) for any missed "time + TEAM/TEAM"
+    if start_idx > 0 and not pregame_pairs:
+        for k in range(0, start_idx):
+            if IS_TIME.search(lines[k]) and k + 2 < start_idx:
+                if TEAM_RE.match(lines[k+1]) and TEAM_RE.match(lines[k+2]):
+                    a = norm_team(lines[k+1]); b = norm_team(lines[k+2])
+                    pregame_pairs.append((a,b))
+                    pregame_teams.update([a,b])
+                    pregame_headers.append(lines[k])
+
+    # Deduplicate pairs
     if pregame_pairs:
         uniq = set()
         pairs_dedup = []
@@ -230,8 +226,7 @@ def pts_remaining_by_count_diff(your: Participant, others: List[Participant]) ->
 # ---------------- UI ----------------
 st.set_page_config(page_title="CBS Pick 'Em — Analyzer", layout="wide")
 st.title("🏈 CBS Pick 'Em — Analyzer")
-st.caption("Your entry uses PRE-GAME headers/codes first, manual remaining teams if provided, "
-           "and count-difference fallback if needed. Everyone else uses Missing Numbers.")
+st.caption("Header detection + manual override + fallback. Now with check-figures and redundant time scanner.")
 
 raw = st.text_area("Paste the visible text from your Weekly Standings page (include the scoreboard at the top):", height=420)
 override_max = st.number_input("Optional: Override Max Confidence (leave 0 to auto)", 0, 30, 0, 1)
@@ -265,7 +260,7 @@ if st.button("Analyze", type="primary"):
                 manual_set = set(manual_teams)
 
                 # ---- Check-figures ----
-                games_left = max(0, len(pregame_pairs))  # number of matchups not started
+                games_left = max(0, len(pregame_pairs))
                 completed_games = max(0, (max_conf if max_conf else 0) - games_left)
                 c1, c2, c3 = st.columns(3)
                 with c1: st.metric("Week Size (Max Confidence)", max_conf)
@@ -278,18 +273,13 @@ if st.button("Analyze", type="primary"):
 
                 rows = []
                 for p in parts:
-                    # Default: Missing Numbers for everyone
                     pts_rem = pts_remaining_missing_numbers(p, max_conf)
 
                     if you_obj and p is you_obj:
-                        # Primary: manual override or detected teams
                         remaining_set = manual_set if manual_set else pregame_teams
                         pts_try = pts_remaining_for_entry(p, remaining_set)
-
-                        # Fallback: count-difference
                         if pts_try == 0:
                             pts_try = pts_remaining_by_count_diff(p, others)
-
                         pts_rem = pts_try
 
                     rows.append({
@@ -325,4 +315,4 @@ if st.button("Analyze", type="primary"):
             st.error(f"Parsing failed: {e}")
 
 st.divider()
-st.caption("Version: v1.4.1")
+st.caption("Version: v1.4.2")
