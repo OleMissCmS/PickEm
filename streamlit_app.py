@@ -1,6 +1,6 @@
 
-# streamlit_app.py — Robust header scan + safe multiselect defaults + check-figures
-# Version: v1.4.3
+# streamlit_app.py — Show "KC vs JAX", stricter your-row logic, smart preselect
+# Version: v1.4.4
 
 import re
 from dataclasses import dataclass
@@ -82,7 +82,6 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
     pregame_headers: List[str] = []
     i, n = 0, len(lines)
 
-    # Primary scan
     while i < n:
         if _looks_like_participant_block(lines, i):
             break
@@ -97,7 +96,6 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
             continue
 
         if IS_TIME.search(line):
-            # Look ahead up to 6 lines for TEAM/TEAM (handle an intervening 'TIE' or dash)
             found = []
             for j in range(i+1, min(i+7, n)):
                 tok = lines[j]
@@ -134,11 +132,10 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
 
     start_idx = i
 
-    # Redundant mini-scan in the header region (0..start_idx) for any missed "time + TEAM/TEAM"
+    # Redundant mini-scan if nothing found
     if start_idx > 0 and not pregame_pairs:
         for k in range(0, start_idx):
             if IS_TIME.search(lines[k]) and k + 2 < start_idx:
-                # seek two team codes within next 6 lines
                 found = []
                 for j in range(k+1, min(k+7, start_idx)):
                     tok = lines[j]
@@ -216,7 +213,11 @@ def pts_remaining_missing_numbers(p: Participant, max_conf: int) -> int:
     used = {c for _, c in p.picks}
     return sum(c for c in range(1, max_conf + 1) if c not in used)
 
-def pts_remaining_for_entry(p: Participant, remaining_teams: Set[str]) -> int:
+def pts_remaining_for_entry_using_pairs(p: Participant, pairs: List[Tuple[str,str]]) -> int:
+    """Sum confidences for your picks that belong to any of the pre-game pairs."""
+    remaining_teams = set()
+    for a,b in pairs:
+        remaining_teams.add(a); remaining_teams.add(b)
     return sum(conf for (team, conf) in p.picks if team != "-" and norm_team(team) in remaining_teams)
 
 def pts_remaining_by_count_diff(your: Participant, others: List[Participant]) -> int:
@@ -237,7 +238,7 @@ def pts_remaining_by_count_diff(your: Participant, others: List[Participant]) ->
 # ---------------- UI ----------------
 st.set_page_config(page_title="CBS Pick 'Em — Analyzer", layout="wide")
 st.title("🏈 CBS Pick 'Em — Analyzer")
-st.caption("Header detection + manual override + fallback. Now with check-figures and safe defaults.")
+st.caption("Header detection + manual override + fallback. Now shows 'KC vs JAX' matchups and stricter your-row logic.")
 
 raw = st.text_area("Paste the visible text from your Weekly Standings page (include the scoreboard at the top):", height=420)
 override_max = st.number_input("Optional: Override Max Confidence (leave 0 to auto)", 0, 30, 0, 1)
@@ -253,18 +254,28 @@ if st.button("Analyze", type="primary"):
             if not parts:
                 st.warning("No participants parsed. Double-check your paste.")
             else:
-                names = [p.name for p in parts]
-                your_name = st.selectbox("Your entry (optional):", ["(none)"] + names, index=0)
+                # Smart preselect: if exactly one person has more picks than the group modal, select them
+                counts = [len(p.picks) for p in parts]
+                try:
+                    base = mode([c for c in counts if c]) if any(counts) else 0
+                except StatisticsError:
+                    sc = sorted([c for c in counts if c])
+                    base = sc[len(sc)//2] if sc else 0
+                candidates = [p.name for p in parts if len(p.picks) > base]
+                default_idx = 0
+                names = ["(none)"] + [p.name for p in parts]
+                if len(candidates) == 1:
+                    default_idx = names.index(candidates[0])
+                your_name = st.selectbox("Your entry (optional):", names, index=default_idx)
 
                 all_confs = [conf for p in parts for (_, conf) in p.picks]
                 auto_max = max(all_confs) if all_confs else 0
                 max_conf = override_max if override_max > 0 else auto_max
 
-                # Manual override for remaining teams — ensure options include pregame teams too
+                # Manual override options include pick teams ∪ pregame teams
                 pick_tokens = {norm_team(t) for p in parts for (t, _) in p.picks if t != "-"}
                 options_all = sorted(pick_tokens.union(pregame_teams))
-                defaults = sorted(pregame_teams.intersection(pick_tokens)) if pick_tokens else sorted(pregame_teams)
-                # If defaults would be empty but we still have pregame teams not in picks, allow empty default (user can select)
+                defaults = sorted(pick_tokens.intersection(pregame_teams)) if pick_tokens else sorted(pregame_teams)
                 manual_teams = st.multiselect(
                     "Manual override — Remaining matchup teams (optional)",
                     options=options_all,
@@ -281,6 +292,9 @@ if st.button("Analyze", type="primary"):
                 with c2: st.metric("Completed Games", completed_games)
                 with c3: st.metric("Games Left", games_left)
 
+                if pregame_pairs:
+                    st.markdown("**Games Remaining:** " + ", ".join([f"{a} vs {b}" for (a,b) in pregame_pairs]))
+
                 # --- Build table ---
                 you_obj = next((p for p in parts if p.name == your_name), None) if your_name != "(none)" else None
                 others = [p for p in parts if you_obj and p is not you_obj]
@@ -290,10 +304,17 @@ if st.button("Analyze", type="primary"):
                     pts_rem = pts_remaining_missing_numbers(p, max_conf)
 
                     if you_obj and p is you_obj:
-                        remaining_set = manual_set if manual_set else pregame_teams
-                        pts_try = pts_remaining_for_entry(p, remaining_set)
+                        # Primary: use pregame PAIRS for your entry (safer)
+                        pts_try = pts_remaining_for_entry_using_pairs(p, pregame_pairs)
+
+                        # If manual override provided, apply it as union with header teams
+                        if manual_set:
+                            pts_try = sum(conf for (team, conf) in p.picks if team != "-" and team in manual_set.union({t for pair in pregame_pairs for t in pair}))
+
+                        # Fallback: count-difference
                         if pts_try == 0:
                             pts_try = pts_remaining_by_count_diff(p, others)
+
                         pts_rem = pts_try
 
                     rows.append({
@@ -324,9 +345,10 @@ if st.button("Analyze", type="primary"):
                     st.write(f"**Detected PRE-GAME pairs:** {pregame_pairs}")
                     if your_name != "(none)" and you_obj:
                         st.write(f"**Your picks (normalized):** {[(t, c) for (t, c) in you_obj.picks]}")
+                        st.write(f"**Your pick count vs group base:** {len(you_obj.picks)} vs {base}")
 
         except Exception as e:
             st.error(f"Parsing failed: {e}")
 
 st.divider()
-st.caption("Version: v1.4.3")
+st.caption("Version: v1.4.4")
