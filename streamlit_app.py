@@ -1,7 +1,6 @@
 
-# streamlit_app.py — Paste Analyzer with PRE-GAME + manual override + count-difference fallback
-# Adds check-figures: Completed Games & Games Left
-# Version: v1.4.0
+# streamlit_app.py — Paste Analyzer with stronger header scan + check-figures
+# Version: v1.4.1
 
 import re
 from dataclasses import dataclass
@@ -17,7 +16,6 @@ class Participant:
     current_points: float
     picks: List[Tuple[str, int]]  # (TEAM_OR_DASH, CONF)
 
-# ---------- team normalization ----------
 TEAM_ALIASES = {
     "JAC": "JAX", "JAX": "JAX",
     "WSH": "WAS", "WAS": "WAS",
@@ -47,21 +45,22 @@ def norm_team(tok: str) -> str:
     t = re.sub(r"[^A-Za-z]", "", tok.upper())
     return TEAM_ALIASES.get(t, t)
 
-# ---------- regexes ----------
 RANK_RE  = re.compile(r"^(\d{1,2})(st|nd|rd|th)$", re.I)
 TEAM_RE  = re.compile(r"^[A-Za-z]{2,4}$")
 PICK_INLINE_RE = re.compile(r"^\s*([A-Z]{2,4}|-)\s*\(\s*(\d{1,2})\s*\)\s*$")
 NUMS_LINE_2INTS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
 CONF_ONLY_RE = re.compile(r"^\s*\(\s*(\d{1,2})\s*\)\s*$")
 
-# Scoreboard status detectors
 IS_FINAL = re.compile(r"\bfinal\b", re.I)
 IS_LIVE  = re.compile(r"\b(q[1-4]|1st|2nd|3rd|4th|ot)\b|\b\d{1,2}:\d{2}\b", re.I)
-IS_TIME  = re.compile(r"(?:(Mon|Tue|Tues|Wed|Thu|Thur|Fri|Sat|Sun)|Today|Tonight)\s+\d{1,2}:\d{2}\s*[AaPp][Mm]\b", re.I)
+# Expanded time regex to allow "pm", "p.m.", and optional tz token like CT/ET
+IS_TIME  = re.compile(r"(?:(Mon|Tue|Tues|Wed|Thu|Thur|Fri|Sat|Sun)|Today|Tonight)\s+\d{1,2}:\d{2}\s*[AaPp]\.?\s*[Mm]\.?(?:\s*(ET|CT|MT|PT))?\b", re.I)
 IS_CODE  = re.compile(r"^[A-Za-z]{2,4}\s*-\s*[A-Za-z]{2,4}$")
 NOISE_RE = re.compile(r"^(TIE|[–—-])$", re.I)
 
 def _clean_lines(raw: str) -> List[str]:
+    # Normalize non-breaking spaces
+    raw = raw.replace("\xa0", " ")
     lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
     return [ln for ln in lines if ln]
 
@@ -78,24 +77,39 @@ def _look_ahead_two_teams(lines: List[str], start: int, window: int = 8) -> Opti
                 return found[0], found[1]
     return None
 
+def _looks_like_participant_block(lines: List[str], i: int) -> bool:
+    """Return True if lines[i] is the start of a participant block: rank, name, points line."""
+    n = len(lines)
+    if i >= n or not RANK_RE.match(lines[i]):
+        return False
+    if i + 2 >= n:
+        return False
+    name_line = lines[i+1]
+    points_line = lines[i+2]
+    # Name: letters/spaces and not obviously a team code or time header
+    if TEAM_RE.match(name_line) or IS_TIME.search(name_line) or IS_CODE.match(name_line):
+        return False
+    # Points line should have at least a number
+    if not (NUMS_LINE_2INTS_RE.match(points_line) or re.search(r"\d", points_line)):
+        return False
+    return True
+
 def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,str]], List[str]]:
-    """
-    Returns:
-      start_idx: index of first rank line (e.g., '1st')
-      pregame_teams: set of teams in PRE-GAME matchups
-      pregame_pairs: list of (teamA, teamB) PRE-GAME pairs
-      pregame_headers: raw header lines that triggered PRE-GAME (for debug)
-    """
     pregame_teams: Set[str] = set()
     pregame_pairs: List[Tuple[str,str]] = []
     pregame_headers: List[str] = []
     i, n = 0, len(lines)
 
-    while i < n and not RANK_RE.match(lines[i]):
+    while i < n:
+        # Only break when we are sure we've hit the participant table
+        if _looks_like_participant_block(lines, i):
+            break
+
         line = lines[i]
 
         # Skip finished/live blocks
         if IS_FINAL.search(line) or IS_LIVE.search(line):
+            # Try to leap over a scoreboard cluster if present
             if i + 2 < n and TEAM_RE.match(lines[i+1]) and TEAM_RE.match(lines[i+2]):
                 i += 5 if i + 4 < n else 3
             else:
@@ -130,10 +144,20 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[Tuple[str,s
 
         i += 1
 
-    while i < n and not RANK_RE.match(lines[i]):
-        i += 1
+    # Ensure we start participants exactly at the first block
+    start_idx = i
+    # Deduplicate pairs (KC-JAX and code line both present)
+    if pregame_pairs:
+        uniq = set()
+        pairs_dedup = []
+        for a,b in pregame_pairs:
+            key = tuple(sorted((a,b)))
+            if key not in uniq:
+                uniq.add(key)
+                pairs_dedup.append((a,b))
+        pregame_pairs = pairs_dedup
 
-    return i, pregame_teams, pregame_pairs, pregame_headers
+    return start_idx, pregame_teams, pregame_pairs, pregame_headers
 
 def parse_participants(lines: List[str], start_idx: int) -> List[Participant]:
     parts: List[Participant] = []
@@ -301,4 +325,4 @@ if st.button("Analyze", type="primary"):
             st.error(f"Parsing failed: {e}")
 
 st.divider()
-st.caption("Version: v1.4.0")
+st.caption("Version: v1.4.1")
