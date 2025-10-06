@@ -1,9 +1,8 @@
 
-# streamlit_app.py — Paste Analyzer with PRE-GAME logic for your entry
-# Improvements:
-#  • Stronger PRE-GAME detection (handles "Mon 7:15PM", "Tonight 7:15 pm", etc.)
-#  • Team code normalization (e.g., JAC ↔ JAX, WSH ↔ WAS, SD→LAC, STL→LAR, OAK→LV)
-#  • Debug panel shows detected PRE-GAME teams (normalized) and your pick tokens
+# streamlit_app.py — Paste Analyzer with robust PRE-GAME logic for your entry
+# Everyone: Missing Numbers method
+# Your entry: PRE-GAME (derived from scoreboard area: time headers, matchup codes like "KC-JAX", or "TIE" blocks)
+# Treats "- (N)" as used
 # Requires: streamlit, pandas
 
 import re
@@ -21,14 +20,13 @@ class Participant:
 
 # ---------- team normalization ----------
 TEAM_ALIASES = {
-    # Current common aliases
     "JAC": "JAX", "JAX": "JAX",
     "WSH": "WAS", "WAS": "WAS",
     "LA": "LAR", "LAR": "LAR", "STL": "LAR",
     "SD": "LAC", "LAC": "LAC",
     "OAK": "LV", "LVR": "LV", "LV": "LV",
     "ARZ": "ARI", "ARI": "ARI", "AZ": "ARI",
-    "TAM": "TB", "TB": "TB", "TBB": "TB",
+    "TAM": "TB", "TBB": "TB", "TB": "TB",
     "GNB": "GB", "GB": "GB",
     "KAN": "KC", "KCC": "KC", "KC": "KC",
     "NWE": "NE", "NE": "NE",
@@ -37,45 +35,64 @@ TEAM_ALIASES = {
     "CLV": "CLE", "CLE": "CLE",
     "HST": "HOU", "HOU": "HOU",
     "BLT": "BAL", "BAL": "BAL",
-    "JAXU": "JAX",  # just in case odd scrape
-    # leave others identity-mapped dynamically
+    "NYG": "NYG", "NYJ": "NYJ",
+    "SEA": "SEA", "BUF": "BUF", "MIA": "MIA",
+    "MIN": "MIN", "PHI": "PHI", "PIT": "PIT",
+    "DET": "DET", "CHI": "CHI", "DAL": "DAL",
+    "TEN": "TEN", "ATL": "ATL", "CAR": "CAR",
 }
 
 def norm_team(tok: str) -> str:
-    if tok == "-" or not tok:
+    if not tok or tok == "-":
         return tok
     t = re.sub(r"[^A-Za-z]", "", tok.upper())
     return TEAM_ALIASES.get(t, t)
 
 # ---------- regexes ----------
-RANK_RE = re.compile(r"^(\d{1,2})(st|nd|rd|th)$", re.I)
-TEAM_RE = re.compile(r"^[A-Za-z]{2,4}$")
+RANK_RE  = re.compile(r"^(\d{1,2})(st|nd|rd|th)$", re.I)
+TEAM_RE  = re.compile(r"^[A-Za-z]{2,4}$")
 PICK_INLINE_RE = re.compile(r"^\s*([A-Z]{2,4}|-)\s*\(\s*(\d{1,2})\s*\)\s*$")
 NUMS_LINE_2INTS_RE = re.compile(r"^\s*(\d+)\s+(\d+)\s*$")
 CONF_ONLY_RE = re.compile(r"^\s*\(\s*(\d{1,2})\s*\)\s*$")
 
 # Scoreboard status detectors
 IS_FINAL = re.compile(r"\bfinal\b", re.I)
-IS_LIVE = re.compile(r"\b(q[1-4]|1st|2nd|3rd|4th|ot)\b|\b\d{1,2}:\d{2}\b", re.I)
-# Broader pregame time detector: weekday or 'Tonight' + time + am/pm (space optional)
-IS_TIME = re.compile(
-    r"(?:(Mon|Tue|Tues|Wed|Thu|Thur|Fri|Sat|Sun)|Tonight)\s+\d{1,2}:\d{2}\s*[AaPp][Mm]\b", re.I
-)
+IS_LIVE  = re.compile(r"\b(q[1-4]|1st|2nd|3rd|4th|ot)\b|\b\d{1,2}:\d{2}\b", re.I)
+# PRE-GAME time header: weekday / Today / Tonight + time am/pm
+IS_TIME  = re.compile(r"(?:(Mon|Tue|Tues|Wed|Thu|Thur|Fri|Sat|Sun)|Today|Tonight)\s+\d{1,2}:\d{2}\s*[AaPp][Mm]\b", re.I)
+# Matchup code like KC-JAX
+IS_CODE  = re.compile(r"^[A-Za-z]{2,4}\s*-\s*[A-Za-z]{2,4}$")
+# Simple noise tokens often between lines
+NOISE_RE = re.compile(r"^(TIE|[–—-])$", re.I)
 
 def _clean_lines(raw: str) -> List[str]:
     lines = [ln.strip() for ln in raw.replace("\r", "").split("\n")]
     return [ln for ln in lines if ln]
 
+def _look_ahead_two_teams(lines: List[str], start: int, window: int = 8) -> Optional[Tuple[str, str]]:
+    """Scan next up-to-`window` lines for the first two team codes (skip noise)."""
+    found = []
+    n = len(lines)
+    for j in range(start + 1, min(start + 1 + window, n)):
+        tok = lines[j].strip()
+        if NOISE_RE.match(tok):
+            continue
+        if TEAM_RE.match(tok) and tok != "-":
+            found.append(norm_team(tok))
+            if len(found) == 2:
+                return found[0], found[1]
+    return None
+
 def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[str]]:
     """
-    Read the scoreboard block (before first rank) and return:
-      - start index of participants
-      - set of NORMALIZED TEAM abbreviations appearing in PRE-GAME matchups
-      - raw header lines we considered PRE-GAME (for debug)
-    Heuristics:
-      FINAL/OT -> decided
-      Qx / mm:ss -> LIVE
-      'Mon 7:15 PM' / 'Tonight 7:15PM' -> PRE-GAME; next two lines are team codes
+    Returns:
+      start_idx: index of first rank line (e.g., '1st')
+      pregame_teams: set of normalized team codes in PRE-GAME matchups
+      pregame_headers: raw header lines that triggered PRE-GAME (for debug)
+    PRE-GAME triggers (any of):
+      • time header (Mon/Tonight/etc)
+      • matchup code like 'KC-JAX'
+      • 'TIE' line with two team lines just above
     """
     pregame_teams: Set[str] = set()
     pregame_headers: List[str] = []
@@ -84,25 +101,44 @@ def parse_games_block(lines: List[str]) -> Tuple[int, Set[str], List[str]]:
     while i < n and not RANK_RE.match(lines[i]):
         line = lines[i]
 
+        # FINAL or LIVE -> skip the typical block if teams present, else step
         if IS_FINAL.search(line) or IS_LIVE.search(line):
-            # Skip status + TEAM + TEAM + SCORE + SCORE (when present)
-            if i + 4 < n and TEAM_RE.match(lines[i+1]) and TEAM_RE.match(lines[i+2]):
-                i += 5
-            else:
-                i += 1
-        elif IS_TIME.search(line):
-            # PRE-GAME
             if i + 2 < n and TEAM_RE.match(lines[i+1]) and TEAM_RE.match(lines[i+2]):
-                t1 = norm_team(lines[i+1])
-                t2 = norm_team(lines[i+2])
-                pregame_teams.update([t1, t2])
-                pregame_headers.append(line)
-                i += 3
+                i += 5 if i + 4 < n else 3  # status + team + team (+scores)
             else:
                 i += 1
-        else:
-            i += 1
+            continue
 
+        # TIME header: look ahead for the first two team codes
+        if IS_TIME.search(line):
+            pair = _look_ahead_two_teams(lines, i, window=8)
+            if pair:
+                a, b = pair
+                pregame_teams.update([a, b])
+                pregame_headers.append(line)
+            i += 1
+            continue
+
+        # MATCHUP code like KC-JAX
+        if IS_CODE.match(line):
+            a, b = [norm_team(t) for t in re.split(r"-", line)]
+            pregame_teams.update([a, b])
+            pregame_headers.append(line)
+            i += 1
+            continue
+
+        # 'TIE' under two team lines → treat as PRE-GAME pair
+        if line.upper() == "TIE" and i >= 2 and TEAM_RE.match(lines[i-2]) and TEAM_RE.match(lines[i-1]):
+            a = norm_team(lines[i-2]); b = norm_team(lines[i-1])
+            pregame_teams.update([a, b])
+            pregame_headers.append("TIE")
+            i += 1
+            continue
+
+        # unknown/noise
+        i += 1
+
+    # move exactly to first rank line
     while i < n and not RANK_RE.match(lines[i]):
         i += 1
 
@@ -155,7 +191,7 @@ def parse_participants(lines: List[str], start_idx: int) -> List[Participant]:
     return parts
 
 def pts_remaining_missing_numbers(p: Participant, max_conf: int) -> int:
-    used = {c for _, c in p.picks}  # '-' counts as used (we normalized but kept '-')
+    used = {c for _, c in p.picks}  # '-' counts as used
     return sum(c for c in range(1, max_conf + 1) if c not in used)
 
 def pts_remaining_pregame_only(p: Participant, pregame_teams: Set[str]) -> int:
@@ -163,9 +199,9 @@ def pts_remaining_pregame_only(p: Participant, pregame_teams: Set[str]) -> int:
 
 # --------------- UI ---------------
 st.set_page_config(page_title="CBS Pick 'Em — Paste Analyzer", layout="wide")
-st.title("🏈 CBS Pick 'Em — Paste Analyzer")
-st.caption("Everyone uses **Missing Numbers**. Your selected entry uses **PRE-GAME** (from scoreboard headers). "
-           "Live (Q1/3:21/etc.) and Final games do **not** count as remaining.")
+st.title("🏈 CBS Pick 'Em — Paste Analyzer (Robust PRE-GAME)")
+st.caption("Everyone uses **Missing Numbers**. Your selected entry uses **PRE-GAME** from scoreboard headers/codes. "
+           "We scan ahead after time headers, accept codes like **KC-JAX**, and normalize team aliases (JAC↔JAX, WSH↔WAS, SD→LAC, STL→LAR, OAK→LV, etc.).")
 
 raw = st.text_area("Paste the visible text from your Weekly Standings page:", height=380)
 override_max = st.number_input("Optional: Override Max Confidence (leave 0 to auto)", 0, 30, 0, 1)
@@ -220,9 +256,9 @@ if st.button("Analyze", type="primary"):
                 st.subheader("Standings with Remaining Ceiling")
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
-                # Debug expander (helps verify mismatches like JAC vs JAX)
+                # Debug expander
                 with st.expander("Debug — PRE-GAME detection & your picks"):
-                    st.write("**PRE-GAME header lines detected:**")
+                    st.write("**PRE-GAME header/code lines detected:**")
                     if pregame_headers:
                         for h in pregame_headers:
                             st.write(f"• {h}")
@@ -232,11 +268,11 @@ if st.button("Analyze", type="primary"):
                     if your_name != "(none)":
                         you = next((p for p in parts if p.name == your_name), None)
                         if you:
-                            st.write(f"**Your picks (normalized):** {[ (t, c) for (t, c) in you.picks ]}")
+                            st.write(f"**Your picks (normalized):** {[(t, c) for (t, c) in you.picks]}")
                             st.write(f"**PRE-GAME teams (normalized):** {sorted(pregame_teams)}")
                             pre_pts = pts_remaining_pregame_only(you, pregame_teams)
                             st.write(f"**PRE-GAME points sum for {your_name}: {pre_pts}**")
 
         except Exception as e:
             st.error(f"Parsing failed: {e}")
-            st.info("Make sure the scoreboard header is included so PRE-GAME lines like 'Mon 7:15 PM' are present.")
+            st.info("Make sure the scoreboard header section is included (time lines, matchup codes, or TIE).")
